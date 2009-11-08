@@ -48,6 +48,11 @@ def progress(text):
 	out('progress ' + text + '\n')
 	sys.stdout.flush()
 
+def log(text):
+	sys.stderr.write(text)
+	sys.stderr.write("\n")
+	sys.stderr.flush()
+
 class Meta:
 	def __init__(self, file):
 		self.struct = struct.Struct('LLLLB')
@@ -135,7 +140,7 @@ class User:
 				self.isip = True
 				try:
 					self.id = struct.unpack('!I', socket.inet_aton(singletext(lv1)))[0]
-				except socket.error:
+				except (socket.error, UnicodeError):
 					# IP could not be parsed. Leave ID as -1 then.
 					pass
 		if not self.isip:
