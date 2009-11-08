@@ -1,14 +1,17 @@
 This is Levitation, a project to convert Wikipedia database dumps into Git
 repositories. It has been successfully tested with a small Wiki
-(pdc.wikipedia.org) having 3,700 articles and 40,000 revisions. Importing
-those took 10 minutes on a Core 2 Duo 1.66 GHz. RAM usage is minimal: Pages are
-imported one after the other, it will at most require the amount of memory
+(bar.wikipedia.org) having 12,200 articles and 104,000 revisions. Importing
+those took 6 minutes on a Core 2 Duo 1.66 GHz. RAM usage is minimal: Pages
+are imported one after the other, it will at most require the amount of memory
 needed to keep all revisions of a single page into memory. You should be safe
 with 1 GB of RAM.
 
 See below (“Things that work”) for the current status.
 
-Some knowledge of Git is required to use this tool.
+Some knowledge of Git is required to use this tool. And you will probably
+need to edit some variables in the source code.
+
+You need at least a 2.5 Python, my tests run with 2.6.
 
 
 How it should be done:
@@ -19,64 +22,7 @@ http://download.wikimedia.org/backup-index.html
 The pages-meta-history.xml file is what we want. (In case you’re wondering:
 Wikimedia does not offer content SQL dumps anymore, and there are now full-
 history dump for en.wikipedia.org because of its size.) It includes all pages
-in all namespaces and all of their revisions. The problem is the data’s order.
-
-In the dump files, the first <page> tag contains the first page that has been
-created and all of its revisions. The second <page> tag contains the second
-page and all of its revisions, and so on. However, when importing into Git, you
-need that data sorted by the revision’s time, across all pages.
-
-Confused? Let me rephrase that. The data in the XML dump is grouped by pages.
-Assuming the Wiki was created in 2005, you get the very first revision of the
-very first page and then every following revision _of_that_page_, even if the
-last revision is from 2 days ago. Then, the stream goes on with the second page
-that was ever created, back in 2005, and again all of its history. The pages in
-the XML are ordered by the date they were first created.
-
-In contrast, Git wants the first commit to be the state _of_the_whole_Wiki_ at
-the time the first page was created. That one is easy, as it is the first
-revision in the XML stream. The second commit is not so easy, though. If the
-second change on that Wiki was to modify the one (and only) existing page,
-that’s fine. If, however, a second page was created, the next commit needs to
-add that page’s content, without first doing something with the other revisions
-of the first page.
-
-Therefore you need to reorder the data in the dump. Reordering several TB of
-data isn’t the most trivial thing to do. A careful balance between performance,
-disk and memory usage must be found. The plan is as follows.
-
-In order to minimize the amount of disk space required, the import.py tool
-reads the XML stream from stdin, allowing you to pipe a file that is
-decompressed on the fly (using bzip2 or 7zip) through it.
-
-import.py’s stdout should be connected to git-fast-import, which will take care
-of writing the revisions to disk. Since they are in the wrong order, only blobs
-will be created at that time. import.py will use the “mark” feature of
-git-fast-import to provide the MediaWiki revision ID (which is unique over all
-pages) to git-fast-import. That way, we will later be able to reference that
-particular revision when creating commits.
-
-However, we still need to remember all the revisions’ metadata and be able to
-access it in a fast way given the revision ID. To be able to do that, an
-additional metadata file will be written while reading the XML stream. It
-contains, for each revision, a fixed-width dataset, at the position
-(revision-number * dataset-width).
-
-Additionally, we need to keep track of user-id/user-name relations. A second
-file keeps track of those, using 255-byte strings per user, again at the
-position (user-id * 256) since the first byte stores string length.
-
-The same is true for page titles, therefore we need a third file.
-
-Now we have to walk through the revisions file and create a commit using the
-blob we already created, collecting page title and author name from the other
-files as we go.
-
-The real content files will need to be put into different directories because
-of limitations in the maximum number of files per directory.
-
-
-Now to the actual implementation:
+in all namespaces and all of their revisions.
 
 
 Things that work:
@@ -95,21 +41,16 @@ Things that work:
  - Store additional information in the commit message that specifies page and
    revision ID as well as whether the edit was marked as “minor”.
 
+ - Use the page’s name as file name instead of the page ID. Non-ASCII
+   characters and some ASCII ones will be replaced by “.XX”, where .XX is their
+   hex value.
+
+ - Put pages in namespace-based subdirectories.
+
+ - Put pages in a configurably deep subdirectory hierarchy.
+
 
 Things that are still missing:
-
- - Use the page’s name as file name instead of the page ID. To do that, we need
-   a meta file that stores the page names. Page name _should_ be limited to 255
-   _bytes_ UTF-8, however MediaWiki is not quite clear about whether that
-   should actually be _characters_. Additionally, the page name does not
-   include the namespace name, even if though in the dump it’s prefixed with
-   the namespace. The meta file needs to store the namespace ID as well. Since
-   there usually are only a few namespaces (10 or 20), we can keep their names
-   in RAM.
-
- - Think of a neat file hierarchy for the file tree: You cannot throw 3 million
-   articles into a single directory. Instead, you need additional subdirectory
-   levels. I’ll probably go for the first n bytes of the hashed article name.
 
  - Use command line options instead of hard-coded magic behavior.
 
@@ -121,9 +62,9 @@ Things that are still missing:
 
 Things that are strange:
 
- - The resulting Git repo is larger than the _uncompressed_ XML file. Delta
-   compression is working fine. I suspect the problem is large trees because
-   of the still missing subdirectories.
+ - Since we use subdirectories, the Git repo is no longer larger than the
+   uncompressed XML file, but instead about 30% of it. This is good. However,
+   it is still way larger than the bz2 compressed file, and I don’t know why.
 
 
 Things that are cool:
@@ -155,13 +96,11 @@ This will import the pdc.wikipedia.org dump into a new Git repository “repo”
 
 Storage requirements:
 
-“maxrev” be the highest revision ID in the file. You may probably retrieve this
-  using something like: tac dump.xml | grep -m 1 '^      <id>'
+“maxrev” be the highest revision ID in the file.
 
-“maxuser” be the highest user ID in the file. You may probably retrieve this
-  using something like:
-  grep '^        <id>' dump.xml | tr -cd '0-9\n' | sort -n | tail -n 1
-  However, since this is dead slow, rather ask the Wiki beforehand.
+“maxpage” be the highest page ID in the file.
+
+“maxuser” be the highest user ID in the file.
 
 The revision metadata storage (METAFILE) needs maxrev*17 bytes.
 
@@ -169,20 +108,17 @@ The revision comment storage (COMMFILE) needs maxrev*257 bytes.
 
 The author name storage (USERFILE) needs maxuser*257 bytes.
 
+The page title storage (PAGEFILE) needs maxpage*257 bytes.
+
 Those files can be deleted after an import.
 
-Additionally, the content itself needs some space. Currently the space
-efficiency isn’t too good, expect 1.5 to 3 times the size of the uncompressed
-XML data (see “Things that are strange”).
+Additionally, the content itself needs some space. My test repo was about 15%
+the size of the uncompressed XML, that is about 300% the size of the bz2
+compressed XML data (see “Things that are strange”).
 
-Also, do not try to throw more than, say, 20.000 pages into your repo. As long
-as we’re not dividing content into subdirectories (and currently we aren’t),
-this will likely hit your “max files in a directory” limit and make OS tools
-slow. I’m working on that.
-
-Note that the filesystem the repo will be living on needs quite a few free
-inodes. If you get “no space left on device” errors with plenty of space
-available, that’s what hit you.
+Note that if you want to check out a working copy, the filesystem it will be
+living on needs quite a few free inodes. If you get “no space left on device”
+errors with plenty of space available, that’s what hit you.
 
 
 Contacting the author:
@@ -195,6 +131,8 @@ Find ways to contact me on http://scytale.name/contact/, talk to me on Twitter
 (@Scytale) or on IRC (freenode, #oqlt).
 
 Get the most up-to-date code at http://scytale.name/proj/levitation/.
+
+Please also read the FAQ if you have any questions, including “how can I help”.
 
 
 This whole bunch of tasty bytes is licensed under the terms of the WTFPLv2.
