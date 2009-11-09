@@ -17,20 +17,54 @@ import struct
 import sys
 import time
 import urlparse
+from optparse import OptionParser
 
 # How many bytes to read at once. You probably can leave this alone.
 # FIXME: With smaller READ_SIZE this tends to crash on the final read?
 READ_SIZE = 10240000
 # The encoding for input, output and internal representation. Leave alone.
 ENCODING = 'UTF-8'
-# Don't import more than this number of _pages_ (not revisions).
-IMPORT_MAX = 100
-# Where to store meta information. Eats 17 bytes per revision.
-METAFILE = '.import-meta'
-# Where to store comment information. Eats 257 bytes per revision.
-COMMFILE = '.import-comm'
-# Where to store author information. Eats 257 bytes per author.
-USERFILE = '.import-user'
+
+
+def parse_args(args):
+	usage = 'Usage: git init --bare repo && bzcat pages-meta-history.xml.bz2 | \\\n' \
+	        '       %prog [options] | GIT_DIR=repo git fast-import | sed \'s/^progress //\''
+	parser = OptionParser(usage=usage)
+	parser.add_option("-m", "--max", dest="IMPORT_MAX", metavar="IMPORT_MAX",
+			help="Specify the maxium pages to import, -1 for all (default: 100)",
+			default=100, type="int")
+	parser.add_option("-d", "--deepness", dest="DEEPNESS", metavar="DEEPNESS",
+			help="Specify the deepness of the result directory structure (default: 3)",
+			default=3, type="int")
+	parser.add_option("-c", "--committer", dest="COMMITTER", metavar="COMITTER",
+			help="git \"Committer\" used while doing the commits (default: \"Levitation <levitation@scytale.name>\")",
+			default="Levitation <levitation@scytale.name>")
+	parser.add_option("-M", "--metafile", dest="METAFILE", metavar="META",
+			help="File for storing meta information (17 bytes/rev) (default: .import-meta)",
+			default=".import-meta")
+	parser.add_option("-C", "--commfile", dest="COMMFILE", metavar="COMM",
+			help="File for storing comment information (257 bytes/rev) (default: .import-comm)",
+			default=".import-comm")
+	parser.add_option("-U", "--userfile", dest="USERFILE", metavar="USER",
+			help="File for storing author information (257 bytes/author) (default: .import-user)",
+			default=".import-user")
+	parser.add_option("-P", "--pagefile", dest="PAGEFILE", metavar="PAGE",
+			help="File for storing page information (257 bytes/page) (default: .import-page)",
+			default=".import-page")
+	(options, args) = parser.parse_args(args)
+	return (options, args)
+
+def tzoffset():
+	r = time.strftime('%z')
+	if r == '' or r == '%z':
+		return None
+	return r
+
+def tzoffsetorzero():
+	r = tzoffset()
+	if r == None:
+		return '+0000'
+	return r
 
 def singletext(node):
 	if len(node.childNodes) == 0:
@@ -40,6 +74,15 @@ def singletext(node):
 	if node.childNodes[0].nodeType != node.TEXT_NODE:
 		raise Exception('singletext child is not text')
 	return node.childNodes[0].data
+
+def asciiize_char(s):
+	r = ''
+	for x in s.group(0):
+		r += '.' + x.encode('hex').upper()
+	return r
+
+def asciiize(s):
+	return re.sub('[^A-Za-z0-9_ ()-]', asciiize_char, s)
 
 def out(text):
 	sys.stdout.write(text)
@@ -60,12 +103,15 @@ class Meta:
 		self.maxrev = -1
 		self.fh = open(file, 'wb+')
 		self.domain = 'unknown.invalid'
+		self.nstoid = self.idtons = {}
 	def write(self, rev, time, page, author, minor):
 		flags = 0
 		if minor:
 			flags += 1
 		if author.isip:
 			flags += 2
+		if author.isdel:
+			flags += 4
 		data = self.struct.pack(
 			rev,
 			timegm(time.utctimetuple()),
@@ -89,6 +135,7 @@ class Meta:
 			'user':   tuple[3],
 			'minor':  False,
 			'isip':   False,
+			'isdel':  False,
 			}
 		if d['rev'] != 0:
 			d['exists'] = True
@@ -101,36 +148,48 @@ class Meta:
 		if flags & 2:
 			d['isip'] = True
 			d['user'] = socket.inet_ntoa(struct.pack('!I', tuple[3]))
+		if flags & 4:
+			d['isdel'] = True
 		return d
 
 class StringStore:
 	max_length = 255
 	def __init__(self, file):
-		self.struct = struct.Struct('Bb%ss' %self.max_length)
+		self.struct = struct.Struct('Bb255s')
 		self.maxid = -1
 		self.fh = open(file, 'wb+')
 	def write(self, id, text, flags = 1):
-		data = self.struct.pack(len(text[:self.max_length]), flags,
-		                        text[:self.max_length])
+		if len(text) > 255:
+			progress('warning: trimming %s bytes long text: 0x%s' % (len(text), text.encode('hex')))
+			text = text[0:255].decode(ENCODING, 'ignore').encode(ENCODING)
+		data = self.struct.pack(len(text), flags, text)
 		self.fh.seek(id * self.struct.size)
 		self.fh.write(data)
 		if self.maxid < id:
 			self.maxid = id
 	def read(self, id):
 		self.fh.seek(id * self.struct.size)
-		data = self.struct.unpack(self.fh.read(self.struct.size))
-		d = {
-			'len':   data[0],
-			'flags': data[1],
-			'text':  data[2][0:data[0]]
-			}
+		packed = self.fh.read(self.struct.size)
+		data = None
+		if len(packed) < self.struct.size:
+			# There is no such entry.
+			d = {'len': 0, 'flags': 0, 'text': ''}
+		else:
+			data = self.struct.unpack(packed)
+			d = {
+				'len':   data[0],
+				'flags': data[1],
+				'text':  data[2][0:data[0]]
+				}
 		return d
 
 class User:
 	def __init__(self, node, meta):
 		self.id = -1
 		self.name = None
-		self.isip = False
+		self.isip = self.isdel = False
+		if node.hasAttribute('deleted') and node.getAttribute('deleted') == 'deleted':
+			self.isdel = True
 		for lv1 in node.childNodes:
 			if lv1.nodeType != lv1.ELEMENT_NODE:
 				continue
@@ -143,10 +202,10 @@ class User:
 				self.isip = True
 				try:
 					self.id = struct.unpack('!I', socket.inet_aton(singletext(lv1)))[0]
-				except (socket.error, UnicodeError):
+				except (socket.error, UnicodeEncodeError):
 					# IP could not be parsed. Leave ID as -1 then.
 					pass
-		if not self.isip:
+		if not (self.isip or self.isdel):
 			meta['user'].write(self.id, self.name)
 
 class Revision:
@@ -172,7 +231,7 @@ class Revision:
 				self.comment = singletext(lv1)
 			elif lv1.tagName == 'text':
 				self.text = singletext(lv1)
-	def dump(self, title):
+	def dump(self):
 		self.meta['meta'].write(self.id, self.timestamp, self.page, self.user, self.minor)
 		if self.comment:
 			self.meta['comm'].write(self.id, self.comment.encode(ENCODING))
@@ -184,22 +243,31 @@ class Page:
 	def __init__(self, dom, meta):
 		self.revisions = []
 		self.id = -1
-		self.title = ''
+		self.nsid = 0
+		self.title = self.fulltitle = ''
 		self.meta = meta
 		self.dom = dom
 		for lv1 in self.dom.documentElement.childNodes:
 			if lv1.nodeType != lv1.ELEMENT_NODE:
 				continue
 			if lv1.tagName == 'title':
-				self.title = singletext(lv1)
+				self.fulltitle = singletext(lv1).encode(ENCODING)
+				split = self.fulltitle.split(':', 1)
+				if len(split) > 1 and self.meta['meta'].nstoid.has_key(split[0]):
+					self.nsid = self.meta['meta'].nstoid[split[0]]
+					self.title = split[1]
+				else:
+					self.nsid = self.meta['meta'].nstoid['']
+					self.title = self.fulltitle
 			elif lv1.tagName == 'id':
 				self.id = int(singletext(lv1))
 			elif lv1.tagName == 'revision':
 				self.revisions.append(Revision(lv1, self.id, self.meta))
+		self.meta['page'].write(self.id, self.title, self.nsid)
 	def dump(self):
-		progress('   ' + self.title.encode(ENCODING))
+		progress('   ' + self.fulltitle)
 		for revision in self.revisions:
-			revision.dump(self.title)
+			revision.dump()
 
 class BlobWriter:
 	def __init__(self, meta):
@@ -245,26 +313,41 @@ class BlobWriter:
 			if name == 'page':
 				Page(dom, meta).dump()
 				self.imported += 1
-				if IMPORT_MAX > 0 and self.imported >= IMPORT_MAX:
+				max = self.meta['options'].IMPORT_MAX
+				if max > 0 and self.imported >= max:
 					self.expat.StartElementHandler = None
 					self.cancel = True
 			elif name == 'base':
 				self.meta['meta'].domain = urlparse.urlparse(singletext(dom.documentElement)).hostname.encode(ENCODING)
 			elif name == 'namespace':
-				pass
+				k = int(self.lastattrs['key'])
+				v = singletext(dom.documentElement).encode(ENCODING)
+				self.meta['meta'].idtons[k] = v
+				self.meta['meta'].nstoid[v] = k
 
 class Committer:
 	def __init__(self, meta):
 		self.meta = meta
+		if tzoffset() == None:
+			progress('warning: using %s as local time offset since your system refuses to tell me the right one;' \
+				'commit (but not author) times will most likely be wrong' % tzoffsetorzero())
 	def work(self):
 		rev = commit = 1
 		day = ''
 		while rev <= self.meta['meta'].maxrev:
 			meta = self.meta['meta'].read(rev)
-			comm = self.meta['comm'].read(rev)
 			rev += 1
 			if not meta['exists']:
 				continue
+			page = self.meta['page'].read(meta['page'])
+			comm = self.meta['comm'].read(meta['rev'])
+			namespace = asciiize('%d-%s' % (page['flags'], self.meta['meta'].idtons[page['flags']]))
+			title = page['text']
+			subdirtitle = ''
+			for i in range(0, min(self.meta['options'].DEEPNESS, len(title))):
+				subdirtitle += asciiize(title[i]) + '/'
+			subdirtitle += asciiize(title)
+			filename = namespace + '/' + subdirtitle + '.mediawiki'
 			if meta['minor']:
 				minor = ' (minor)'
 			else:
@@ -280,6 +363,9 @@ class Committer:
 			if meta['isip']:
 				author = meta['user']
 				authoruid = 'ip-' + author
+			elif meta['isdel']:
+				author = '[deleted user]'
+				authoruid = 'deleted'
 			else:
 				authoruid = 'uid-' + str(meta['user'])
 				author = self.meta['user'].read(meta['user'])['text']
@@ -287,17 +373,22 @@ class Committer:
 				'commit refs/heads/master\n' +
 				'mark :%d\n' % commit +
 				'author %s <%s@git.%s> %d +0000\n' % (author, authoruid, self.meta['meta'].domain, meta['epoch']) +
-				'committer Importer <importer@FIXME> %d +0000\n' % time.time() +
+				'committer %s %d %s\n' % (self.meta['options'].COMMITTER, time.time(), tzoffsetorzero()) +
 				'data %d\n%s\n' % (len(msg), msg) +
 				fromline +
-				'M 100644 :%d %d.mediawiki\n' % (meta['rev'] + 1, meta['page'])
+				'M 100644 :%d %s\n' % (meta['rev'] + 1, filename)
 				)
 			commit += 1
 
+
+(options, _args) = parse_args(sys.argv[1:])
+
 meta = { # FIXME: Use parameters.
-	'meta': Meta(METAFILE),
-	'comm': StringStore(COMMFILE),
-	'user': StringStore(USERFILE),
+	'options': options,
+	'meta': Meta(options.METAFILE),
+	'comm': StringStore(options.COMMFILE),
+	'user': StringStore(options.USERFILE),
+	'page': StringStore(options.PAGEFILE),
 	}
 
 progress('Step 1: Creating blobs.')
