@@ -104,12 +104,14 @@ class Meta:
 		return d
 
 class StringStore:
+	max_length = 255
 	def __init__(self, file):
-		self.struct = struct.Struct('Bb255s')
+		self.struct = struct.Struct('Bb%ss' %self.max_length)
 		self.maxid = -1
 		self.fh = open(file, 'wb+')
 	def write(self, id, text, flags = 1):
-		data = self.struct.pack(len(text), flags, text)
+		data = self.struct.pack(len(text[:self.max_length]), flags,
+		                        text[:self.max_length])
 		self.fh.seek(id * self.struct.size)
 		self.fh.write(data)
 		if self.maxid < id:
